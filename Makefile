@@ -1,34 +1,57 @@
-APP_NAME ?= FreeFlow Dev
-BUNDLE_ID ?= com.zachlatta.freeflow.dev
+# Qliq build file.
+#
+# Qliq is a locally built macOS menu-bar dictation app. This Makefile compiles
+# the app directly with swiftc; there is no Xcode project and no package
+# resolution step.
+
+APP_NAME ?= Qliq
+BUNDLE_ID ?= com.pvhkr.qliq
 BUILD_DIR = build
 APP_BUNDLE = $(BUILD_DIR)/$(APP_NAME).app
-CODESIGN_IDENTITY ?= FreeFlow Dev
 CONTENTS = $(APP_BUNDLE)/Contents
 MACOS_DIR = $(CONTENTS)/MacOS
+RESOURCES = $(CONTENTS)/Resources
 empty :=
 space := $(empty) $(empty)
 APP_EXECUTABLE = $(MACOS_DIR)/$(APP_NAME)
 APP_EXECUTABLE_TARGET := $(subst $(space),\ ,$(APP_EXECUTABLE))
 
 SOURCES = $(shell find Sources -name '*.swift' -type f | LC_ALL=C sort)
-TEST_RUNNER = $(BUILD_DIR)/FreeFlowTests
-RESOURCES = $(CONTENTS)/Resources
+TEST_RUNNER = $(BUILD_DIR)/QliqTests
 ARCH ?= $(shell uname -m)
 
-# Pick the icon source based on which bundle we are building. Dev builds get
-# a distinct hammer-on-waveform icon so a developer's dock shows at a glance
-# which FreeFlow they are running when both are installed side by side.
-ifeq ($(APP_NAME),FreeFlow Dev)
-ICON_SOURCE = Resources/AppIcon-Dev-Source.png
-ICON_ICNS = Resources/AppIcon-Dev.icns
+# Ad-hoc signing by default. Replace with your own identity if you have one; see
+# README.md for why this matters for permission prompts.
+CODESIGN_IDENTITY ?= -
+
+# SDK pin.
+#
+# The macOS 27 SDK declares SwiftUI's @State/@Binding/@Environment as external
+# macros, and the plugin that expands them ships inside Xcode rather than the
+# Command Line Tools. With CLT only, every SwiftUI view fails to compile with
+# "plugin for module 'SwiftUIMacros' not found".
+#
+# macOS 26.5 is the last SDK in the CLT that still declares those attributes as
+# property wrappers, so pin it. The app still targets macOS 13; only the SDK used
+# to compile is older. Set SDK=... on the command line to override.
+CLT_SDK_26 := /Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk
+ifeq ($(wildcard $(CLT_SDK_26)),)
+SDK ?= $(shell xcrun --show-sdk-path)
 else
-ICON_SOURCE = Resources/AppIcon-Source.png
-ICON_ICNS = Resources/AppIcon.icns
+SDK ?= $(CLT_SDK_26)
 endif
 
-.PHONY: all clean run icon dmg codesign-dmg notarize test
+ICON_SOURCE = Resources/AppIcon-Source.png
+ICON_ICNS = Resources/AppIcon.icns
+
+.PHONY: all clean run icon test check-sdk
 
 all: $(APP_EXECUTABLE_TARGET)
+
+check-sdk:
+	@echo "SDK:  $(SDK)"
+	@echo "Arch: $(ARCH)"
+	@echo "Sign: $(CODESIGN_IDENTITY)"
 
 $(APP_EXECUTABLE_TARGET): $(SOURCES) Info.plist $(ICON_ICNS)
 	@mkdir -p "$(MACOS_DIR)" "$(RESOURCES)"
@@ -36,13 +59,13 @@ ifeq ($(ARCH),universal)
 	swiftc \
 		-parse-as-library \
 		-o "$(MACOS_DIR)/$(APP_NAME)-arm64" \
-		-sdk $(shell xcrun --show-sdk-path) \
+		-sdk $(SDK) \
 		-target arm64-apple-macosx13.0 \
 		$(SOURCES)
 	swiftc \
 		-parse-as-library \
 		-o "$(MACOS_DIR)/$(APP_NAME)-x86_64" \
-		-sdk $(shell xcrun --show-sdk-path) \
+		-sdk $(SDK) \
 		-target x86_64-apple-macosx13.0 \
 		$(SOURCES)
 	lipo -create -output "$(MACOS_DIR)/$(APP_NAME)" \
@@ -53,7 +76,7 @@ else
 	swiftc \
 		-parse-as-library \
 		-o "$(MACOS_DIR)/$(APP_NAME)" \
-		-sdk $(shell xcrun --show-sdk-path) \
+		-sdk $(SDK) \
 		-target $(ARCH)-apple-macosx13.0 \
 		$(SOURCES)
 endif
@@ -62,11 +85,9 @@ endif
 	@plutil -replace CFBundleDisplayName -string "$(APP_NAME)" "$(CONTENTS)/Info.plist"
 	@plutil -replace CFBundleExecutable -string "$(APP_NAME)" "$(CONTENTS)/Info.plist"
 	@plutil -replace CFBundleIdentifier -string "$(BUNDLE_ID)" "$(CONTENTS)/Info.plist"
-	@cp $(ICON_ICNS) "$(RESOURCES)/AppIcon.icns"
 	@plutil -replace NSMicrophoneUsageDescription -string "$(APP_NAME) needs microphone access to transcribe your speech." "$(CONTENTS)/Info.plist"
-	@plutil -replace NSSpeechRecognitionUsageDescription -string "$(APP_NAME) needs speech recognition to convert your voice to text." "$(CONTENTS)/Info.plist"
-	@plutil -replace NSAccessibilityUsageDescription -string "$(APP_NAME) needs accessibility access to detect the text cursor position and paste transcribed text." "$(CONTENTS)/Info.plist"
-	@codesign --force --options runtime --sign "$(CODESIGN_IDENTITY)" --entitlements FreeFlow.entitlements "$(APP_BUNDLE)"
+	@cp $(ICON_ICNS) "$(RESOURCES)/AppIcon.icns"
+	@codesign --force --sign "$(CODESIGN_IDENTITY)" --entitlements Qliq.entitlements "$(APP_BUNDLE)"
 	@echo "Built $(APP_BUNDLE)"
 
 test: $(TEST_RUNNER)
@@ -77,7 +98,7 @@ $(TEST_RUNNER): Sources/AppContextService.swift Sources/LLMAPITransport.swift So
 	swiftc \
 		-parse-as-library \
 		-o "$(TEST_RUNNER)" \
-		-sdk $(shell xcrun --show-sdk-path) \
+		-sdk $(SDK) \
 		-target $(ARCH)-apple-macosx13.0 \
 		Sources/AppContextService.swift Sources/LLMAPITransport.swift Sources/ModelConfiguration.swift Tests/AppContextServiceTests.swift
 
@@ -98,39 +119,6 @@ $(ICON_ICNS): $(ICON_SOURCE)
 	@iconutil -c icns -o $@ $(BUILD_DIR)/AppIcon.iconset
 	@rm -rf $(BUILD_DIR)/AppIcon.iconset
 	@echo "Generated $@"
-
-dmg: all
-	@rm -f "$(BUILD_DIR)/$(APP_NAME).dmg"
-	@rm -rf $(BUILD_DIR)/dmg-staging
-	@mkdir -p $(BUILD_DIR)/dmg-staging
-	@cp -R "$(APP_BUNDLE)" $(BUILD_DIR)/dmg-staging/
-	@osascript -e 'tell application "Finder" to make alias file to POSIX file "/Applications" at POSIX file "'"$$(cd $(BUILD_DIR)/dmg-staging && pwd)"'"'
-	@ALIAS=$$(find $(BUILD_DIR)/dmg-staging -maxdepth 1 -not -name '*.app' -not -name '.DS_Store' -type f | head -1) && mv "$$ALIAS" "$(BUILD_DIR)/dmg-staging/Applications"
-	@fileicon set "$(BUILD_DIR)/dmg-staging/Applications" /System/Library/CoreServices/CoreTypes.bundle/Contents/Resources/ApplicationsFolderIcon.icns
-	@echo "Creating DMG..."
-	@create-dmg \
-		--volname "$(APP_NAME)" \
-		--volicon "$(ICON_ICNS)" \
-		--background "Resources/dmg-background.tiff" \
-		--window-pos 200 120 \
-		--window-size 660 400 \
-		--icon-size 128 \
-		--icon "$(APP_NAME).app" 180 170 \
-		--hide-extension "$(APP_NAME).app" \
-		--icon "Applications" 480 170 \
-		--no-internet-enable \
-		"$(BUILD_DIR)/$(APP_NAME).dmg" \
-		"$(BUILD_DIR)/dmg-staging"
-	@rm -rf $(BUILD_DIR)/dmg-staging
-	@echo "Created $(BUILD_DIR)/$(APP_NAME).dmg"
-
-codesign-dmg: dmg
-	codesign --force --sign "$(CODESIGN_IDENTITY)" "$(BUILD_DIR)/$(APP_NAME).dmg"
-
-notarize:
-	xcrun notarytool submit "$(BUILD_DIR)/$(APP_NAME).dmg" \
-		--keychain-profile "$(NOTARIZE_PROFILE)" --wait
-	xcrun stapler staple "$(BUILD_DIR)/$(APP_NAME).dmg"
 
 clean:
 	rm -rf $(BUILD_DIR)
